@@ -18,7 +18,6 @@ package pages
 import (
 	"fmt"
 	"html/template"
-	"log"
 	"net/http"
 	"net/url"
 	"path"
@@ -26,78 +25,82 @@ import (
 	"strings"
 	"time"
 
-	"github.com/google/cadvisor/info"
+	info "github.com/google/cadvisor/info/v1"
 	"github.com/google/cadvisor/manager"
+
+	"github.com/golang/glog"
 )
 
 const ContainersPage = "/containers/"
 
+// from http://golang.org/doc/effective_go.html#constants
+type ByteSize float64
+
+const (
+	_ = iota
+	// KB - kilobyte
+	KB ByteSize = 1 << (10 * iota)
+	// MB - megabyte
+	MB
+	// GB - gigabyte
+	GB
+	// TB - terabyte
+	TB
+	// PB - petabyte
+	PB
+	// EB - exabyte
+	EB
+	// ZB - zettabyte
+	ZB
+	// YB - yottabyte
+	YB
+)
+
+func (b ByteSize) Size() string {
+	for _, i := range [...]ByteSize{YB, ZB, EB, PB, TB, GB, MB, KB} {
+		if b >= i {
+			return fmt.Sprintf("%.2f", b/i)
+		}
+	}
+	return fmt.Sprintf("%.2f", b)
+}
+
+func (b ByteSize) Unit() string {
+	switch {
+	case b >= YB:
+		return "YB"
+	case b >= ZB:
+		return "ZB"
+	case b >= EB:
+		return "EB"
+	case b >= PB:
+		return "PB"
+	case b >= TB:
+		return "TB"
+	case b >= GB:
+		return "GB"
+	case b >= MB:
+		return "MB"
+	case b >= KB:
+		return "KB"
+	}
+	return "B"
+}
+
 var funcMap = template.FuncMap{
-	"containerLink":         containerLink,
-	"printMask":             printMask,
-	"printCores":            printCores,
-	"printMegabytes":        printMegabytes,
-	"containerNameEquals":   containerNameEquals,
-	"getMemoryUsage":        getMemoryUsage,
-	"getMemoryUsagePercent": getMemoryUsagePercent,
-	"getHotMemoryPercent":   getHotMemoryPercent,
-	"getColdMemoryPercent":  getColdMemoryPercent,
+	"printMask":   printMask,
+	"printCores":  printCores,
+	"printShares": printShares,
+	"printSize":   printSize,
+	"printUnit":   printUnit,
 }
 
-// TODO(vmarmol): Consider housekeeping Spec too so we can show changes through time. We probably don't need it ever second though.
-
-var pageTemplate *template.Template
-
-type pageData struct {
-	ContainerName      string
-	ParentContainers   []string
-	Subcontainers      []string
-	Spec               *info.ContainerSpec
-	Stats              []*info.ContainerStats
-	MachineInfo        *info.MachineInfo
-	ResourcesAvailable bool
-	CpuAvailable       bool
-	MemoryAvailable    bool
-}
-
-func init() {
-	pageTemplate = template.New("containersTemplate").Funcs(funcMap)
-	_, err := pageTemplate.Parse(containersHtmlTemplate)
-	if err != nil {
-		log.Fatalf("Failed to parse template: %s", err)
-	}
-}
-
-// TODO(vmarmol): Escape this correctly.
-func containerLink(containerName string, basenameOnly bool, cssClasses string) interface{} {
-	var displayName string
-	if basenameOnly {
-		displayName = path.Base(string(containerName))
-	} else {
-		displayName = string(containerName)
-	}
-	if containerName == "root" {
-		containerName = "/"
-	}
-	return template.HTML(fmt.Sprintf("<a class=\"%s\" href=\"%s%s\">%s</a>", cssClasses, ContainersPage[:len(ContainersPage)-1], containerName, displayName))
-}
-
-func containerNameEquals(c1 string, c2 string) bool {
-	return c1 == c2
-}
-
-func printMask(mask *info.CpuSpecMask, numCores int) interface{} {
-	// TODO(vmarmol): Detect this correctly.
-	// TODO(vmarmol): Support more than 64 cores.
-	rawMask := uint64(0)
-	if len(mask.Data) > 0 {
-		rawMask = mask.Data[0]
-	}
+func printMask(mask string, numCores int) interface{} {
 	masks := make([]string, numCores)
-	for i := uint(0); i < uint(numCores); i++ {
+	activeCores := getActiveCores(mask)
+	for i := 0; i < numCores; i++ {
 		coreClass := "inactive-cpu"
-		// by default, all cores are active
-		if ((0x1<<i)&rawMask) != 0 || len(mask.Data) == 0 {
+		if activeCores[i] {
 			coreClass = "active-cpu"
 		}
 		masks[i] = fmt.Sprintf("<span class=\"%s\">%d</span>", coreClass, i)
@@ -105,60 +108,76 @@ func printMask(mask *info.CpuSpecMask, numCores int) interface{} {
 	return template.HTML(strings.Join(masks, "&nbsp;"))
 }
 
-func printCores(millicores *uint64) string {
-	// TODO(vmarmol): Detect this correctly
-	if *millicores > 1024*1000 {
-		return "unlimited"
+func getActiveCores(mask string) map[int]bool {
+	activeCores := make(map[int]bool)
+	for _, corebits := range strings.Split(mask, ",") {
+		cores := strings.Split(corebits, "-")
+		if len(cores) == 1 {
+			index, err := strconv.Atoi(cores[0])
+			if err != nil {
+				// Ignore malformed strings.
+				continue
+			}
+			activeCores[index] = true
+		} else if len(cores) == 2 {
+			start, err := strconv.Atoi(cores[0])
+			if err != nil {
+				continue
+			}
+			end, err := strconv.Atoi(cores[1])
+			if err != nil {
+				continue
+			}
+			for i := start; i <= end; i++ {
+				activeCores[i] = true
+			}
+		}
 	}
+	return activeCores
+}
+
+func printCores(millicores *uint64) string {
 	cores := float64(*millicores) / 1000
 	return strconv.FormatFloat(cores, 'f', 3, 64)
 }
 
-func toMegabytes(bytes uint64) float64 {
-	return float64(bytes) / (1 << 20)
+func printShares(shares *uint64) string {
+	return fmt.Sprintf("%d", *shares)
 }
 
-func printMegabytes(bytes uint64) string {
-	// TODO(vmarmol): Detect this correctly
-	if bytes > (100 << 30) {
+// Size after which we consider memory to be "unlimited". This is not
+// MaxInt64 due to rounding by the kernel.
+const maxMemorySize = uint64(1 << 62)
+
+func printSize(bytes uint64) string {
+	if bytes >= maxMemorySize {
 		return "unlimited"
 	}
-	megabytes := toMegabytes(bytes)
-	return strconv.FormatFloat(megabytes, 'f', 3, 64)
+	return ByteSize(bytes).Size()
 }
 
-func toMemoryPercent(usage uint64, spec *info.ContainerSpec) int {
-	return int((usage * 100) / (spec.Memory.Limit))
+func printUnit(bytes uint64) string {
+	if bytes >= maxMemorySize {
+		return ""
+	}
+	return ByteSize(bytes).Unit()
 }
 
-func getMemoryUsage(stats []*info.ContainerStats) string {
-	return strconv.FormatFloat(toMegabytes((stats[len(stats)-1].Memory.Usage)), 'f', 2, 64)
-}
-
-func getMemoryUsagePercent(spec *info.ContainerSpec, stats []*info.ContainerStats) int {
-	return toMemoryPercent((stats[len(stats)-1].Memory.Usage), spec)
-}
-
-func getHotMemoryPercent(spec *info.ContainerSpec, stats []*info.ContainerStats) int {
-	return toMemoryPercent((stats[len(stats)-1].Memory.WorkingSet), spec)
-}
-
-func getColdMemoryPercent(spec *info.ContainerSpec, stats []*info.ContainerStats) int {
-	latestStats := stats[len(stats)-1].Memory
-	return toMemoryPercent((latestStats.Usage)-(latestStats.WorkingSet), spec)
-}
-
-func ServerContainersPage(m manager.Manager, w http.ResponseWriter, u *url.URL) error {
+func serveContainersPage(m manager.Manager, w http.ResponseWriter, u *url.URL) error {
 	start := time.Now()
 
 	// The container name is the path after the handler
 	containerName := u.Path[len(ContainersPage)-1:]
 
 	// Get the container.
-	cont, err := m.GetContainerInfo(containerName)
-	if err != nil {
-		return fmt.Errorf("Failed to get container \"%s\" with error: %s", containerName, err)
+	reqParams := info.ContainerInfoRequest{
+		NumStats: 60,
 	}
+	cont, err := m.GetContainerInfo(containerName, &reqParams)
+	if err != nil {
+		return fmt.Errorf("failed to get container %q with error: %v", containerName, err)
+	}
+	displayName := getContainerDisplayName(cont.ContainerReference)
 
 	// Get the MachineInfo
 	machineInfo, err := m.GetMachineInfo()
@@ -166,34 +185,68 @@ func ServerContainersPage(m manager.Manager, w http.ResponseWriter, u *url.URL) 
 		return err
 	}
 
+	rootDir := getRootDir(containerName)
+
 	// Make a list of the parent containers and their links
-	var parentContainers []string
-	parentContainers = append(parentContainers, string("root"))
-	parentName := ""
-	for _, part := range strings.Split(string(cont.Name), "/") {
-		if part == "" {
+	pathParts := strings.Split(string(cont.Name), "/")
+	parentContainers := make([]link, 0, len(pathParts))
+	parentContainers = append(parentContainers, link{
+		Text: "root",
+		Link: path.Join(rootDir, ContainersPage),
+	})
+	for i := 1; i < len(pathParts); i++ {
+		// Skip empty parts.
+		if pathParts[i] == "" {
 			continue
 		}
-		parentName += "/" + part
-		parentContainers = append(parentContainers, string(parentName))
+		parentContainers = append(parentContainers, link{
+			Text: pathParts[i],
+			Link: path.Join(rootDir, ContainersPage, path.Join(pathParts[1:i+1]...)),
+		})
+	}
+
+	// Build the links for the subcontainers.
+	subcontainerLinks := make([]link, 0, len(cont.Subcontainers))
+	for _, sub := range cont.Subcontainers {
+		if !m.Exists(sub.Name) {
+			continue
+		}
+		subcontainerLinks = append(subcontainerLinks, link{
+			Text: getContainerDisplayName(sub),
+			Link: path.Join(rootDir, ContainersPage, sub.Name),
+		})
 	}
 
 	data := &pageData{
-		ContainerName:      cont.Name,
-		ParentContainers:   parentContainers,
-		Subcontainers:      cont.Subcontainers,
-		Spec:               cont.Spec,
-		Stats:              cont.Stats,
-		MachineInfo:        machineInfo,
-		ResourcesAvailable: cont.Spec.Cpu != nil || cont.Spec.Memory != nil,
-		CpuAvailable:       cont.Spec.Cpu != nil,
-		MemoryAvailable:    cont.Spec.Memory != nil,
+		DisplayName:            displayName,
+		ContainerName:          escapeContainerName(cont.Name),
+		ParentContainers:       parentContainers,
+		Subcontainers:          subcontainerLinks,
+		Spec:                   cont.Spec,
+		Stats:                  cont.Stats,
+		MachineInfo:            machineInfo,
+		IsRoot:                 cont.Name == "/",
+		ResourcesAvailable:     cont.Spec.HasCpu || cont.Spec.HasMemory || cont.Spec.HasNetwork || cont.Spec.HasFilesystem,
+		CpuAvailable:           cont.Spec.HasCpu,
+		MemoryAvailable:        cont.Spec.HasMemory,
+		NetworkAvailable:       cont.Spec.HasNetwork,
+		FsAvailable:            cont.Spec.HasFilesystem,
+		CustomMetricsAvailable: cont.Spec.HasCustomMetrics,
+		SubcontainersAvailable: len(subcontainerLinks) > 0,
+		Root: rootDir,
 	}
 	err = pageTemplate.Execute(w, data)
 	if err != nil {
-		log.Printf("Failed to apply template: %s", err)
+		glog.Errorf("Failed to apply template: %s", err)
 	}
 
-	log.Printf("Request took %s", time.Since(start))
+	glog.V(5).Infof("Request took %s", time.Since(start))
 	return nil
+}
+
+// Build a relative path to the root of the container page.
+func getRootDir(containerName string) string {
+	// The root is at: container depth
+	levels := (strings.Count(containerName, "/"))
+	return strings.Repeat("../", levels)
 }

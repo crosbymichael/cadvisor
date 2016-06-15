@@ -17,82 +17,172 @@ package main
 import (
 	"flag"
 	"fmt"
-	"log"
 	"net/http"
+	"net/http/pprof"
+	"os"
+	"os/signal"
+	"runtime"
+	"strings"
+	"syscall"
 	"time"
 
-	"github.com/google/cadvisor/api"
 	"github.com/google/cadvisor/container"
-	"github.com/google/cadvisor/container/docker"
-	"github.com/google/cadvisor/container/lmctfy"
+	cadvisorhttp "github.com/google/cadvisor/http"
 	"github.com/google/cadvisor/manager"
-	"github.com/google/cadvisor/pages"
-	"github.com/google/cadvisor/pages/static"
+	"github.com/google/cadvisor/utils/sysfs"
+	"github.com/google/cadvisor/version"
+
+	"github.com/golang/glog"
 )
 
+var argIp = flag.String("listen_ip", "", "IP to listen on, defaults to all IPs")
 var argPort = flag.Int("port", 8080, "port to listen")
-var argSampleSize = flag.Int("samples", 1024, "number of samples we want to keep")
-var argResetPeriod = flag.Duration("reset_period", 2*time.Hour, "period to reset the samples")
+var maxProcs = flag.Int("max_procs", 0, "max number of CPUs that can be used simultaneously. Less than 1 for default (number of cores).")
+
+var versionFlag = flag.Bool("version", false, "print cAdvisor version and exit")
+
+var httpAuthFile = flag.String("http_auth_file", "", "HTTP auth file for the web UI")
+var httpAuthRealm = flag.String("http_auth_realm", "localhost", "HTTP auth realm for the web UI")
+var httpDigestFile = flag.String("http_digest_file", "", "HTTP digest file for the web UI")
+var httpDigestRealm = flag.String("http_digest_realm", "localhost", "HTTP digest file for the web UI")
+
+var prometheusEndpoint = flag.String("prometheus_endpoint", "/metrics", "Endpoint to expose Prometheus metrics on")
+
+var maxHousekeepingInterval = flag.Duration("max_housekeeping_interval", 60*time.Second, "Largest interval to allow between container housekeepings")
+var allowDynamicHousekeeping = flag.Bool("allow_dynamic_housekeeping", true, "Whether to allow the housekeeping interval to be dynamic")
+
+var enableProfiling = flag.Bool("profiling", false, "Enable profiling via web interface host:port/debug/pprof/")
+
+var (
+	// Metrics to be ignored.
+	// Tcp metrics are ignored by default.
+	ignoreMetrics metricSetValue = metricSetValue{container.MetricSet{container.NetworkTcpUsageMetrics: struct{}{}}}
+
+	// List of metrics that can be ignored.
+	ignoreWhitelist = container.MetricSet{
+		container.DiskUsageMetrics:       struct{}{},
+		container.NetworkUsageMetrics:    struct{}{},
+		container.NetworkTcpUsageMetrics: struct{}{},
+	}
+)
+
+type metricSetValue struct {
+	container.MetricSet
+}
+
+func (ml *metricSetValue) String() string {
+	var values []string
+	for metric, _ := range ml.MetricSet {
+		values = append(values, string(metric))
+	}
+	return strings.Join(values, ",")
+}
+
+func (ml *metricSetValue) Set(value string) error {
+	ml.MetricSet = container.MetricSet{}
+	if value == "" {
+		return nil
+	}
+	for _, metric := range strings.Split(value, ",") {
+		if ignoreWhitelist.Has(container.MetricKind(metric)) {
+			(*ml).Add(container.MetricKind(metric))
+		} else {
+			return fmt.Errorf("unsupported metric %q specified in disable_metrics", metric)
+		}
+	}
+	return nil
+}
+
+func init() {
+	flag.Var(&ignoreMetrics, "disable_metrics", "comma-separated list of `metrics` to be disabled. Options are 'disk', 'network', 'tcp'. Note: tcp is disabled by default due to high CPU usage.")
+}
 
 func main() {
+	defer glog.Flush()
 	flag.Parse()
-	// XXX(dengnan): Should we allow users to specify which sampler they want to use?
-	container.SetStatsParameter(&container.StatsParameter{
-		Sampler:     "uniform",
-		NumSamples:  *argSampleSize,
-		ResetPeriod: *argResetPeriod,
-	})
-	containerManager, err := manager.New()
+
+	if *versionFlag {
+		fmt.Printf("cAdvisor version %s (%s)\n", version.Info["version"], version.Info["revision"])
+		os.Exit(0)
+	}
+
+	setMaxProcs()
+
+	memoryStorage, err := NewMemoryStorage()
 	if err != nil {
-		log.Fatalf("Failed to create a Container Manager: %s", err)
+		glog.Fatalf("Failed to initialize storage driver: %s", err)
 	}
 
-	if err := lmctfy.Register("/"); err != nil {
-		log.Printf("lmctfy registration failed: %v.", err)
-		log.Print("Running in docker only mode.")
-		if err := docker.Register(containerManager, "/"); err != nil {
-			log.Printf("Docker registration failed: %v.", err)
-			log.Fatalf("Unable to continue without docker or lmctfy.")
-		}
+	sysFs, err := sysfs.NewRealSysFs()
+	if err != nil {
+		glog.Fatalf("Failed to create a system interface: %s", err)
 	}
 
-	if err := docker.Register(containerManager, "/docker"); err != nil {
-		// Ignore this error because we should work with lmctfy only
-		log.Printf("Docker registration failed: %v.", err)
-		log.Print("Running in lmctfy only mode.")
+	containerManager, err := manager.New(memoryStorage, sysFs, *maxHousekeepingInterval, *allowDynamicHousekeeping, ignoreMetrics.MetricSet)
+	if err != nil {
+		glog.Fatalf("Failed to create a Container Manager: %s", err)
 	}
 
-	// Handler for static content.
-	http.HandleFunc(static.StaticResource, func(w http.ResponseWriter, r *http.Request) {
-		err := static.HandleRequest(w, r.URL)
-		if err != nil {
-			fmt.Fprintf(w, "%s", err)
+	mux := http.NewServeMux()
+
+	if *enableProfiling {
+		mux.HandleFunc("/debug/pprof/", pprof.Index)
+		mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+		mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+		mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+	}
+
+	// Register all HTTP handlers.
+	err = cadvisorhttp.RegisterHandlers(mux, containerManager, *httpAuthFile, *httpAuthRealm, *httpDigestFile, *httpDigestRealm)
+	if err != nil {
+		glog.Fatalf("Failed to register HTTP handlers: %v", err)
+	}
+
+	cadvisorhttp.RegisterPrometheusHandler(mux, containerManager, *prometheusEndpoint, nil)
+
+	// Start the manager.
+	if err := containerManager.Start(); err != nil {
+		glog.Fatalf("Failed to start container manager: %v", err)
+	}
+
+	// Install signal handler.
+	installSignalHandler(containerManager)
+
+	glog.Infof("Starting cAdvisor version: %s-%s on port %d", version.Info["version"], version.Info["revision"], *argPort)
+
+	addr := fmt.Sprintf("%s:%d", *argIp, *argPort)
+	glog.Fatal(http.ListenAndServe(addr, mux))
+}
+
+func setMaxProcs() {
+	// TODO(vmarmol): Consider limiting if we have a CPU mask in effect.
+	// Allow as many threads as we have cores unless the user specified a value.
+	var numProcs int
+	if *maxProcs < 1 {
+		numProcs = runtime.NumCPU()
+	} else {
+		numProcs = *maxProcs
+	}
+	runtime.GOMAXPROCS(numProcs)
+
+	// Check if the setting was successful.
+	actualNumProcs := runtime.GOMAXPROCS(0)
+	if actualNumProcs != numProcs {
+		glog.Warningf("Specified max procs of %v but using %v", numProcs, actualNumProcs)
+	}
+}
+
+func installSignalHandler(containerManager manager.Manager) {
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, os.Interrupt, os.Kill, syscall.SIGTERM)
+
+	// Block until a signal is received.
+	go func() {
+		sig := <-c
+		if err := containerManager.Stop(); err != nil {
+			glog.Errorf("Failed to stop container manager: %v", err)
 		}
-	})
-
-	// Handler for the API.
-	http.HandleFunc(api.ApiResource, func(w http.ResponseWriter, r *http.Request) {
-		err := api.HandleRequest(containerManager, w, r.URL)
-		if err != nil {
-			fmt.Fprintf(w, "%s", err)
-		}
-	})
-
-	// Redirect / to containers page.
-	http.Handle("/", http.RedirectHandler(pages.ContainersPage, http.StatusTemporaryRedirect))
-
-	// Register the handler for the containers page.
-	http.HandleFunc(pages.ContainersPage, func(w http.ResponseWriter, r *http.Request) {
-		err := pages.ServerContainersPage(containerManager, w, r.URL)
-		if err != nil {
-			fmt.Fprintf(w, "%s", err)
-		}
-	})
-
-	go containerManager.Start()
-
-	log.Print("About to serve on port ", *argPort)
-
-	addr := fmt.Sprintf(":%v", *argPort)
-	log.Fatal(http.ListenAndServe(addr, nil))
+		glog.Infof("Exiting given signal: %v", sig)
+		os.Exit(0)
+	}()
 }
