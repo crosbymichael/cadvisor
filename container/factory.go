@@ -16,114 +16,129 @@ package container
 
 import (
 	"fmt"
-	"log"
-	"strings"
 	"sync"
+
+	"github.com/google/cadvisor/manager/watcher"
+
+	"github.com/golang/glog"
 )
 
 type ContainerHandlerFactory interface {
-	NewContainerHandler(name string) (ContainerHandler, error)
+	// Create a new ContainerHandler using this factory. CanHandleAndAccept() must have returned true.
+	NewContainerHandler(name string, inHostNamespace bool) (c ContainerHandler, err error)
 
-	// for testability
+	// Returns whether this factory can handle and accept the specified container.
+	CanHandleAndAccept(name string) (handle bool, accept bool, err error)
+
+	// Name of the factory.
 	String() string
+
+	// Returns debugging information. Map of lines per category.
+	DebugInfo() map[string][]string
 }
 
-type factoryTreeNode struct {
-	defaultFactory ContainerHandlerFactory
-	children       map[string]*factoryTreeNode
+// MetricKind represents the kind of metrics that cAdvisor exposes.
+type MetricKind string
+
+const (
+	CpuUsageMetrics        MetricKind = "cpu"
+	MemoryUsageMetrics     MetricKind = "memory"
+	CpuLoadMetrics         MetricKind = "cpuLoad"
+	DiskIOMetrics          MetricKind = "diskIO"
+	DiskUsageMetrics       MetricKind = "disk"
+	NetworkUsageMetrics    MetricKind = "network"
+	NetworkTcpUsageMetrics MetricKind = "tcp"
+	AppMetrics             MetricKind = "app"
+)
+
+func (mk MetricKind) String() string {
+	return string(mk)
 }
 
-func (self *factoryTreeNode) find(elems ...string) ContainerHandlerFactory {
-	node := self
-	for _, elem := range elems {
-		if len(node.children) == 0 {
-			break
-		}
-		if child, ok := node.children[elem]; ok {
-			node = child
-		} else {
-			return node.defaultFactory
-		}
+type MetricSet map[MetricKind]struct{}
+
+func (ms MetricSet) Has(mk MetricKind) bool {
+	_, exists := ms[mk]
+	return exists
+}
+
+func (ms MetricSet) Add(mk MetricKind) {
+	ms[mk] = struct{}{}
+}
+
+// TODO(vmarmol): Consider not making this global.
+// Global list of factories.
+var (
+	factories     = map[watcher.ContainerWatchSource][]ContainerHandlerFactory{}
+	factoriesLock sync.RWMutex
+)
+
+// Register a ContainerHandlerFactory. These should be registered from least general to most general
+// as they will be asked in order whether they can handle a particular container.
+func RegisterContainerHandlerFactory(factory ContainerHandlerFactory, watchTypes []watcher.ContainerWatchSource) {
+	factoriesLock.Lock()
+	defer factoriesLock.Unlock()
+
+	for _, watchType := range watchTypes {
+		factories[watchType] = append(factories[watchType], factory)
 	}
-
-	return node.defaultFactory
 }
 
-func (self *factoryTreeNode) add(factory ContainerHandlerFactory, elems ...string) {
-	node := self
-	for _, elem := range elems {
-		if node.children == nil {
-			node.children = make(map[string]*factoryTreeNode, 16)
+// Returns whether there are any container handler factories registered.
+func HasFactories() bool {
+	factoriesLock.Lock()
+	defer factoriesLock.Unlock()
+
+	return len(factories) != 0
+}
+
+// Create a new ContainerHandler for the specified container.
+func NewContainerHandler(name string, watchType watcher.ContainerWatchSource, inHostNamespace bool) (ContainerHandler, bool, error) {
+	factoriesLock.RLock()
+	defer factoriesLock.RUnlock()
+
+	// Create the ContainerHandler with the first factory that supports it.
+	for _, factory := range factories[watchType] {
+		canHandle, canAccept, err := factory.CanHandleAndAccept(name)
+		if err != nil {
+			glog.V(4).Infof("Error trying to work out if we can handle %s: %v", name, err)
 		}
-		child, ok := self.children[elem]
-		if !ok {
-			child = &factoryTreeNode{
-				defaultFactory: node.defaultFactory,
-				children:       make(map[string]*factoryTreeNode, 16),
+		if canHandle {
+			if !canAccept {
+				glog.V(3).Infof("Factory %q can handle container %q, but ignoring.", factory, name)
+				return nil, false, nil
 			}
-			node.children[elem] = child
-		}
-		node = child
-	}
-	node.defaultFactory = factory
-}
-
-type factoryManager struct {
-	root *factoryTreeNode
-	lock sync.RWMutex
-}
-
-func dropEmptyString(elems ...string) []string {
-	ret := make([]string, 0, len(elems))
-	for _, e := range elems {
-		if len(e) > 0 {
-			ret = append(ret, e)
-		}
-	}
-	return ret
-}
-
-// Must register factory for root container!
-func (self *factoryManager) Register(path string, factory ContainerHandlerFactory) {
-	self.lock.Lock()
-	defer self.lock.Unlock()
-
-	if self.root == nil {
-		self.root = &factoryTreeNode{
-			defaultFactory: nil,
-			children:       make(map[string]*factoryTreeNode, 10),
+			glog.V(3).Infof("Using factory %q for container %q", factory, name)
+			handle, err := factory.NewContainerHandler(name, inHostNamespace)
+			return handle, canAccept, err
+		} else {
+			glog.V(4).Infof("Factory %q was unable to handle container %q", factory, name)
 		}
 	}
 
-	elems := dropEmptyString(strings.Split(path, "/")...)
-	self.root.add(factory, elems...)
+	return nil, false, fmt.Errorf("no known factory can handle creation of container")
 }
 
-func (self *factoryManager) NewContainerHandler(path string) (ContainerHandler, error) {
-	self.lock.RLock()
-	defer self.lock.RUnlock()
+// Clear the known factories.
+func ClearContainerHandlerFactories() {
+	factoriesLock.Lock()
+	defer factoriesLock.Unlock()
 
-	if self.root == nil {
-		err := fmt.Errorf("nil factory for container %v: no factory registered", path)
-		return nil, err
+	factories = map[watcher.ContainerWatchSource][]ContainerHandlerFactory{}
+}
+
+func DebugInfo() map[string][]string {
+	factoriesLock.RLock()
+	defer factoriesLock.RUnlock()
+
+	// Get debug information for all factories.
+	out := make(map[string][]string)
+	for _, factoriesSlice := range factories {
+		for _, factory := range factoriesSlice {
+			for k, v := range factory.DebugInfo() {
+				out[k] = v
+			}
+		}
 	}
-
-	elems := dropEmptyString(strings.Split(path, "/")...)
-	factory := self.root.find(elems...)
-	if factory == nil {
-		err := fmt.Errorf("nil factory for container %v", path)
-		return nil, err
-	}
-	log.Printf("container handler factory for %v is %v\n", path, factory)
-	return factory.NewContainerHandler(path)
-}
-
-var globalFactoryManager factoryManager
-
-func RegisterContainerHandlerFactory(path string, factory ContainerHandlerFactory) {
-	globalFactoryManager.Register(path, factory)
-}
-
-func NewContainerHandler(path string) (ContainerHandler, error) {
-	return globalFactoryManager.NewContainerHandler(path)
+	return out
 }
